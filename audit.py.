@@ -1,0 +1,100 @@
+import re
+import socket
+import ssl
+import urllib.request
+from urllib.parse import quote, urlparse
+from datetime import datetime, timezone
+
+def checked_at():
+    return datetime.now(timezone.utc).isoformat()
+
+def normalize_domain(value):
+    value = value.strip().lower()
+    if "://" in value:
+        value = urlparse(value).hostname or ""
+    value = value.rstrip(".")
+    pattern = r"(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}"
+    if not re.fullmatch(pattern, value):
+        raise ValueError("Domaine invalide. Exemple : exemple.fr")
+    return value
+
+def audit_domain(value):
+    domain = normalize_domain(value)
+    items = []
+    try:
+        addresses = socket.getaddrinfo(domain, 443, type=socket.SOCK_STREAM)
+        ips = sorted({entry[4][0] for entry in addresses})
+        items.append({"label": "Résolution DNS", "status": "OK", "detail": ", ".join(ips)})
+    except socket.gaierror:
+        return {
+            "title": f"Audit du domaine : {domain}", "checked_at": checked_at(),
+            "scope": "Contrôles publics non intrusifs.",
+            "items": [{"label": "Résolution DNS", "status": "ALERTE", "detail": "Résolution impossible."}]
+        }
+
+    try:
+        context = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=5) as raw:
+            with context.wrap_socket(raw, server_hostname=domain) as tls:
+                cert = tls.getpeercert()
+                items.append({"label": "Certificat TLS", "status": "OK",
+                              "detail": f"Expiration : {cert.get('notAfter', 'inconnue')}."})
+    except Exception as exc:
+        items.append({"label": "Certificat TLS", "status": "À VÉRIFIER",
+                      "detail": f"Connexion TLS non validée ({type(exc).__name__})."})
+
+    try:
+        request = urllib.request.Request("https://" + domain, headers={"User-Agent": "CART3R-OSINT-Searcher/1.0"})
+        with urllib.request.urlopen(request, timeout=7) as response:
+            headers = response.headers
+            for header in ["Strict-Transport-Security", "Content-Security-Policy",
+                           "X-Content-Type-Options", "Referrer-Policy", "Permissions-Policy"]:
+                found = headers.get(header)
+                items.append({"label": header, "status": "PRÉSENT" if found else "ABSENT",
+                              "detail": found or "En-tête absent."})
+            items.append({"label": "Réponse HTTPS", "status": "OK", "detail": f"Code HTTP {response.status}."})
+    except Exception as exc:
+        items.append({"label": "En-têtes HTTP", "status": "À VÉRIFIER",
+                      "detail": f"Site inaccessible ({type(exc).__name__})."})
+
+    return {"title": f"Audit du domaine : {domain}", "checked_at": checked_at(),
+            "scope": "Contrôles techniques publics et non intrusifs.",
+            "items": items}
+
+def audit_email_format(value):
+    email = value.strip()
+    if len(email) > 254 or not re.fullmatch(r"[^\\s@]+@[^\\s@]+\\.[^\\s@]+", email):
+        raise ValueError("Adresse e-mail invalide.")
+    domain = email.rsplit("@", 1)[1].lower()
+    try:
+        socket.getaddrinfo(domain, 25, type=socket.SOCK_STREAM)
+        detail, status = "Le domaine possède une résolution DNS.", "OK"
+    except socket.gaierror:
+        detail, status = "Le domaine ne se résout pas actuellement.", "À VÉRIFIER"
+    return {
+        "title": "Vérification de votre adresse e-mail", "checked_at": checked_at(),
+        "scope": "Aucun e-mail envoyé ni base de fuites interrogée.",
+        "items": [
+            {"label": "Format", "status": "OK", "detail": "Syntaxe plausible."},
+            {"label": "Domaine", "status": status, "detail": detail},
+            {"label": "Fuites de données", "status": "NON VÉRIFIÉ",
+             "detail": "Aucune base de fuites interrogée."}
+        ]
+    }
+
+def username_self_audit(value):
+    username = value.strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{2,30}", username):
+        raise ValueError("Pseudo invalide : 2 à 30 caractères.")
+    encoded = quote(username)
+    links = [
+        ("Recherche Web", f"https://www.google.com/search?q=%22{encoded}%22"),
+        ("GitHub", f"https://github.com/{encoded}"),
+        ("Reddit", f"https://www.reddit.com/user/{encoded}/"),
+        ("GitLab", f"https://gitlab.com/{encoded}"),
+    ]
+    return {
+        "title": f"Auto-audit du pseudonyme : {username}", "checked_at": checked_at(),
+        "scope": "Liens de recherche manuelle pour votre propre pseudonyme.",
+        "items": [{"label": label, "status": "LIEN", "detail": url} for label, url in links]
+    }
